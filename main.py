@@ -1,0 +1,493 @@
+"""大肥鱼钱包保卫战：高峰时段自动暂停模型服务，空闲时段自动恢复。"""
+
+from datetime import datetime
+from pathlib import Path
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.message_components import Image, Plain
+from astrbot.api.star import Context, Star
+
+from .scheduler import (
+    DEFAULT_PEAK_PERIODS,
+    fmt_duration,
+    fmt_periods_for_display,
+    get_zoneinfo,
+    is_peak,
+    next_transition,
+    now_in,
+    parse_periods,
+    parse_weekdays,
+)
+
+ASSETS = Path(__file__).resolve().parent / "assets"
+MY_COMMANDS = ("峰谷", "谷", "时段", "peak", "钱包", "白名单", "wl", "whitelist")
+
+_PROVIDER_NAMES = {
+    "deepseek": "DeepSeek",
+    "openai": "OpenAI",
+    "anthropic": "Claude",
+    "gemini": "Gemini",
+    "ollama": "Ollama",
+    "siliconflow": "硅基流动",
+    "qwen": "通义千问",
+    "doubao": "豆包",
+    "moonshot": "Kimi",
+    "zhipu": "智谱",
+}
+
+
+class FatFishWalletGuard(Star):
+    """大肥鱼钱包保卫战
+
+    高峰时段自动暂停模型服务，空闲时段自动恢复。
+    指令：
+    /峰谷              查询当前时段、供应商、下次切换、白名单、统计
+    /峰谷 统计         今日拦截/豁免
+    /峰谷 强制 拦截|放行|自动   管理员手动控制
+    /白名单            管理可无视拦截的用户与群聊
+    """
+
+    def __init__(self, context: Context, config: AstrBotConfig):
+        super().__init__(context)
+        self.config = config
+        self._wl_loaded = False
+        self._wl_users: set[str] = set()
+        self._wl_groups: set[str] = set()
+
+    def _cfg(self, key, default=None):
+        try:
+            return self.config.get(key, default)
+        except Exception:
+            return default
+
+    def _now(self) -> datetime:
+        return now_in(get_zoneinfo(self._cfg("timezone", "Asia/Shanghai")))
+
+    def _periods(self):
+        return parse_periods(str(self._cfg("peak_periods", DEFAULT_PEAK_PERIODS)))
+
+    def _weekdays(self):
+        return parse_weekdays(str(self._cfg("peak_weekdays", "0,1,2,3,4,5,6") or ""))
+
+    def _render(self, tmpl, provider="") -> str:
+        s = str(tmpl)
+        s = s.replace("{time}", self._now().strftime("%H:%M"))
+        s = s.replace("{provider}", provider or "当前模型")
+        return s
+
+    # 供应商识别
+
+    async def _get_current_provider(self, umo):
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(umo=umo)
+        except Exception:
+            return None, None
+        try:
+            prov = self.context.get_provider_by_id(provider_id)
+        except Exception:
+            prov = None
+        return provider_id, prov
+
+    def _provider_affected(self, provider_id, prov) -> bool:
+        affected = str(self._cfg("affected_providers", "deepseek") or "").strip()
+        if not affected:
+            return False
+        if affected == "*":
+            return True
+        keywords = [k.strip().lower() for k in affected.split(",") if k.strip()]
+        if not keywords:
+            return False
+        if not provider_id or prov is None:
+            return bool(self._cfg("gate_when_provider_unknown", True))
+        try:
+            meta = prov.meta()
+            haystack = " ".join(
+                str(x or "")
+                for x in (
+                    getattr(meta, "id", ""),
+                    getattr(meta, "model", ""),
+                    getattr(meta, "type", ""),
+                )
+            ).lower()
+        except Exception:
+            return bool(self._cfg("gate_when_provider_unknown", True))
+        return any(k in haystack for k in keywords)
+
+    def _provider_display(self, prov) -> str:
+        if prov is None:
+            return "当前模型"
+        try:
+            meta = prov.meta()
+        except Exception:
+            return "当前模型"
+        name = str(getattr(meta, "provider_display_name", "") or "").strip()
+        if name:
+            return name
+        t = str(getattr(meta, "type", "") or "").lower()
+        return _PROVIDER_NAMES.get(t, t.capitalize() or "当前模型")
+
+    async def _provider_name(self, umo) -> str:
+        _, prov = await self._get_current_provider(umo)
+        return self._provider_display(prov)
+
+    def _provider_status_text(self, provider_id, prov) -> str:
+        if not provider_id:
+            return "未识别 / 未配置"
+        model = ptype = ""
+        if prov is not None:
+            try:
+                meta = prov.meta()
+                model = str(getattr(meta, "model", "") or "")
+                ptype = str(getattr(meta, "type", "") or "")
+            except Exception:
+                pass
+        return f"{model or provider_id}（{ptype or '未知'}）"
+
+    # 白名单
+
+    async def _load_whitelist(self):
+        if self._wl_loaded:
+            return
+        try:
+            data = await self.get_kv_data("whitelist", {}) or {}
+            users = {str(x).strip() for x in (data.get("users") or []) if str(x).strip()}
+            groups = {str(x).strip() for x in (data.get("groups") or []) if str(x).strip()}
+            if not users and not groups:
+                users = {
+                    str(x).strip()
+                    for x in (self._cfg("whitelist_users", []) or [])
+                    if str(x).strip()
+                }
+                groups = {
+                    str(x).strip()
+                    for x in (self._cfg("whitelist_groups", []) or [])
+                    if str(x).strip()
+                }
+            self._wl_users, self._wl_groups = users, groups
+        except Exception as e:
+            logger.error(f"[大肥鱼钱包保卫战] 白名单读取失败: {e}")
+        self._wl_loaded = True
+
+    async def _save_whitelist(self):
+        try:
+            await self.put_kv_data(
+                "whitelist",
+                {"users": sorted(self._wl_users), "groups": sorted(self._wl_groups)},
+            )
+        except Exception as e:
+            logger.error(f"[大肥鱼钱包保卫战] 白名单保存失败: {e}")
+
+    def _is_whitelisted(self, event: AstrMessageEvent) -> bool:
+        if event.get_sender_id() in self._wl_users:
+            return True
+        gid = event.get_group_id()
+        return bool(gid and gid in self._wl_groups)
+
+    # 状态与统计
+
+    async def _gate_state(self):
+        try:
+            data = await self.get_kv_data("gate_state", {}) or {}
+            if data.get("date") != self._now().strftime("%Y-%m-%d"):
+                return None
+            return data.get("state")
+        except Exception:
+            return None
+
+    async def _save_gate_state(self, state):
+        try:
+            await self.put_kv_data(
+                "gate_state",
+                {"date": self._now().strftime("%Y-%m-%d"), "state": state},
+            )
+        except Exception:
+            pass
+
+    async def _bump_stats(self, key):
+        try:
+            today = self._now().strftime("%Y-%m-%d")
+            stats = await self.get_kv_data("stats", {}) or {}
+            if stats.get("date") != today:
+                stats = {"date": today, "blocked": 0, "bypassed": 0}
+            stats[key] = int(stats.get(key, 0)) + 1
+            await self.put_kv_data("stats", stats)
+        except Exception:
+            pass
+
+    async def _today_stats(self):
+        try:
+            stats = await self.get_kv_data("stats", {}) or {}
+            if stats.get("date") != self._now().strftime("%Y-%m-%d"):
+                return {"date": self._now().strftime("%Y-%m-%d"), "blocked": 0, "bypassed": 0}
+            return stats
+        except Exception:
+            return {"date": "", "blocked": 0, "bypassed": 0}
+
+    # 消息构造
+
+    def _notice(self, text, image_name, provider=""):
+        chain = [Plain(self._render(text, provider))]
+        if self._cfg("attach_images", True):
+            img = ASSETS / str(image_name)
+            if img.is_file():
+                chain.append(Image.fromFileSystem(str(img)))
+        return MessageChain(chain=chain)
+
+    def _is_my_command(self, event) -> bool:
+        msg = event.get_message_str().strip()
+        if msg.startswith("/"):
+            msg = msg[1:].strip()
+        elif not event.is_at_or_wake_command:
+            return False
+        return any(msg == n or msg.startswith(n + " ") for n in MY_COMMANDS)
+
+    # 高峰闸门
+
+    async def _gate_decision(self, event, now, peak):
+        if not self._cfg("enabled", True):
+            return False, ""
+        override = str(self._cfg("manual_override", "auto") or "auto")
+        if override == "always_allow":
+            return False, ""
+        if self._cfg("admins_bypass", True) and event.is_admin():
+            return False, "admin"
+        if self._is_whitelisted(event):
+            return False, "whitelist"
+        if override == "always_block":
+            return True, "manual"
+        if not peak:
+            return False, ""
+        provider_id, prov = await self._get_current_provider(event.unified_msg_origin)
+        if not self._provider_affected(provider_id, prov):
+            return False, "provider"
+        return True, "peak"
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    async def peak_gate(self, event: AstrMessageEvent):
+        try:
+            if not self._cfg("enabled", True) or self._is_my_command(event):
+                return
+            await self._load_whitelist()
+            now = self._now()
+            peak = is_peak(now, self._periods(), self._weekdays())
+            gated, reason = await self._gate_decision(event, now, peak)
+            prev = await self._gate_state()
+            wake = event.is_at_or_wake_command
+
+            if gated:
+                # 拦截；非唤醒消息不提示，避免刷屏
+                event.should_call_llm(False)
+                event.stop_event()
+                await self._bump_stats("blocked")
+                if not wake:
+                    return
+                provider = await self._provider_name(event.unified_msg_origin)
+                if reason == "manual":
+                    msg = self._cfg("manual_block_msg", "服务已被管理员手动暂停，等待恢复。")
+                elif prev in (None, "offpeak"):
+                    msg = self._cfg(
+                        "peak_msg_enter",
+                        "已进入高峰时段，{provider} 高峰时段费用太贵，该时段将停止服务至空闲时段，到时自动恢复。",
+                    )
+                else:
+                    msg = self._cfg(
+                        "peak_msg_steady",
+                        "当前处于高峰时段，{provider} 费用太贵，服务已暂停，空闲时段自动恢复。",
+                    )
+                await event.send(
+                    self._notice(msg, self._cfg("peak_image", "高峰时段.png"), provider)
+                )
+                await self._save_gate_state("manual" if reason == "manual" else "peak")
+                return
+
+            if peak and reason in ("admin", "whitelist", "provider"):
+                await self._bump_stats("bypassed")
+
+            if wake and not peak:
+                if self._cfg("announce_transition", True) and prev in ("peak", "manual"):
+                    provider = await self._provider_name(event.unified_msg_origin)
+                    await event.send(
+                        self._notice(
+                            self._cfg("offpeak_msg", "已到达空闲时段，服务恢复，可以正常使用了。"),
+                            self._cfg("offpeak_image", "空闲时段.png"),
+                            provider,
+                        )
+                    )
+                await self._save_gate_state("offpeak")
+        except Exception as e:
+            logger.error(f"[大肥鱼钱包保卫战] peak_gate 异常: {e}")
+
+    # 指令：/峰谷
+
+    @filter.command("峰谷", alias={"谷", "时段", "peak", "钱包"})
+    async def peak_status(self, event: AstrMessageEvent, action: str = "", value: str = ""):
+        await self._load_whitelist()
+        action = (action or "").strip()
+        value = (value or "").strip()
+
+        if action == "统计":
+            stats = await self._today_stats()
+            yield event.plain_result(
+                "今日峰谷统计\n"
+                f"日期：{stats.get('date', '')}\n"
+                f"拦截 {stats.get('blocked', 0)} 条\n"
+                f"豁免 {stats.get('bypassed', 0)} 条"
+            )
+            return
+
+        if action == "强制":
+            if not event.is_admin():
+                yield event.plain_result("无权限，仅管理员可操作。")
+                return
+            if value in ("拦截", "开启", "block", "always_block"):
+                self.config["manual_override"] = "always_block"
+                reply = "已强制开启拦截，服务暂停（白名单/管理员仍可用）。"
+            elif value in ("放行", "关闭", "allow", "always_allow"):
+                self.config["manual_override"] = "always_allow"
+                reply = "已强制关闭拦截，服务放行。"
+            elif value in ("自动", "auto"):
+                self.config["manual_override"] = "auto"
+                reply = "已恢复自动模式。"
+            else:
+                yield event.plain_result("用法：/峰谷 强制 拦截|放行|自动")
+                return
+            try:
+                self.config.save_config()
+            except Exception:
+                logger.error("[大肥鱼钱包保卫战] 配置保存失败")
+            yield event.plain_result(reply)
+            return
+
+        if action:
+            yield event.plain_result("用法：/峰谷 [统计] [强制 拦截|放行|自动]")
+            return
+
+        now = self._now()
+        periods = self._periods()
+        weekdays = self._weekdays()
+        peak = is_peak(now, periods, weekdays)
+        target, when = next_transition(now, periods, weekdays)
+        provider_id, prov = await self._get_current_provider(event.unified_msg_origin)
+        affected = self._provider_affected(provider_id, prov)
+        override = str(self._cfg("manual_override", "auto") or "auto")
+
+        if override == "always_allow":
+            state = "手动放行中"
+        elif override == "always_block":
+            state = "手动拦截中"
+        elif not peak:
+            state = "服务正常（空闲时段）"
+        elif not affected:
+            state = "服务正常（当前供应商不在拦截范围）"
+        elif self._cfg("admins_bypass", True) and event.is_admin():
+            state = "服务正常（管理员豁免）"
+        elif self._is_whitelisted(event):
+            state = "服务正常（白名单豁免）"
+        else:
+            state = "高峰拦截中"
+
+        stats = await self._today_stats()
+        periods_txt = fmt_periods_for_display(
+            str(self._cfg("peak_periods", DEFAULT_PEAK_PERIODS))
+        )
+        remain_txt = fmt_duration((when - now).total_seconds())
+        next_txt = "高峰" if target == "peak" else "空闲"
+        lines = [
+            "【大肥鱼钱包保卫战】",
+            f"当前时段：{'高峰' if peak else '空闲'}",
+            f"时段配置：{periods_txt}",
+            f"下次切换：约 {remain_txt} → {next_txt}",
+            f"模型供应商：{self._provider_status_text(provider_id, prov)}",
+            f"服务状态：{state}",
+            f"白名单：用户 {len(self._wl_users)} / 群 {len(self._wl_groups)}",
+            f"今日统计：拦截 {stats.get('blocked', 0)} / 豁免 {stats.get('bypassed', 0)}",
+        ]
+        if override != "auto":
+            lines.append(f"手动开关：{override}")
+
+        text = "\n".join(lines)
+        chain = [Plain(text)]
+        if self._cfg("attach_images", True):
+            image = str(
+                self._cfg("peak_image", "高峰时段.png")
+                if peak
+                else self._cfg("offpeak_image", "空闲时段.png")
+            )
+            img = ASSETS / image
+            if img.is_file():
+                chain.append(Image.fromFileSystem(str(img)))
+        yield event.chain_result(chain)
+
+    # 指令：/白名单
+
+    @filter.command("白名单", alias={"wl", "whitelist"})
+    async def whitelist_mgmt(
+        self,
+        event: AstrMessageEvent,
+        action: str = "",
+        kind: str = "",
+        target: str = "",
+    ):
+        await self._load_whitelist()
+        action = (action or "").strip()
+        kind = (kind or "").strip()
+        target = (target or "").strip()
+
+        if not action:
+            yield event.plain_result(
+                "白名单\n"
+                f"用户（{len(self._wl_users)}）：{'、'.join(sorted(self._wl_users)) or '（空）'}\n"
+                f"群聊（{len(self._wl_groups)}）：{'、'.join(sorted(self._wl_groups)) or '（空）'}\n"
+                "----\n"
+                "/白名单 添加|移除 用户|群 <ID>；/白名单 清空"
+            )
+            return
+
+        if action in ("清空", "clear"):
+            if not event.is_admin():
+                yield event.plain_result("无权限，仅管理员可操作。")
+                return
+            self._wl_users.clear()
+            self._wl_groups.clear()
+            await self._save_whitelist()
+            yield event.plain_result("白名单已清空。")
+            return
+
+        if action in ("添加", "add", "移除", "remove", "删除", "del"):
+            if not event.is_admin():
+                yield event.plain_result("无权限，仅管理员可操作。")
+                return
+            if not kind or not target:
+                yield event.plain_result("用法：/白名单 添加 用户 123456 或 /白名单 添加 群 123456789")
+                return
+            is_user = kind in ("用户", "user", "u")
+            is_group = kind in ("群", "群聊", "group", "g")
+            if not (is_user or is_group):
+                yield event.plain_result("类型须为「用户」或「群」。")
+                return
+            store = self._wl_users if is_user else self._wl_groups
+            if action in ("添加", "add"):
+                store.add(target)
+                verb = "已添加"
+            else:
+                store.discard(target)
+                verb = "已移除"
+            await self._save_whitelist()
+            yield event.plain_result(f"{verb}{'用户' if is_user else '群聊'} {target}。")
+            return
+
+        yield event.plain_result("用法：/白名单 [添加|移除 用户|群 <ID>] [/白名单 清空]")
+
+    # 生命周期
+
+    async def initialize(self):
+        await self._load_whitelist()
+        peak = is_peak(self._now(), self._periods(), self._weekdays())
+        logger.info(
+            f"[大肥鱼钱包保卫战] 已加载，当前{'高峰' if peak else '空闲'}时段，"
+            f"白名单用户 {len(self._wl_users)} / 群 {len(self._wl_groups)}"
+        )
+
+    async def terminate(self):
+        await self._save_whitelist()
