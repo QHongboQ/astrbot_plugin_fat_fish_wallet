@@ -67,10 +67,10 @@
   "manual_block_msg": {
     "description": "手动暂停提示",
     "type": "text",
-    "default": "服务已被管理员手动暂停，等待恢复。"
+    "default": "服务已被管理员手动关闭（拦截），等待恢复。"
   },
   "manual_override": {
-    "description": "手动开关：auto/always_allow/always_block",
+    "description": "手动开关：auto/always_allow(放行)/always_block(拦截)",
     "type": "string",
     "options": ["auto", "always_allow", "always_block"],
     "default": "auto"
@@ -89,5 +89,30 @@
     "description": "初始白名单群（用 /白名单 管理）",
     "type": "list",
     "default": []
+  },
+  "reminder_enabled": {
+    "description": "时段自动提醒",
+    "type": "bool",
+    "default": true
+  },
+  "reminder_targets": {
+    "description": "提醒目标：留空=自动记录的所有群；也可填群号/完整消息来源（如 aiocqhttp:GroupMessage:123）",
+    "type": "list",
+    "default": []
+  },
+  "reminder_lead_minutes": {
+    "description": "高峰开始前提前提醒的分钟数",
+    "type": "int",
+    "default": 5
+  },
+  "reminder_peak_msg": {
+    "description": "高峰即将到来提醒，支持 {time}",
+    "type": "text",
+    "default": "提醒：高峰时段即将到来（约 {time}），过几分钟将暂停模型服务。"
+  },
+  "reminder_offpeak_msg": {
+    "description": "空闲到来提醒，支持 {time}",
+    "type": "text",
+    "default": "提醒：已到达空闲时段，模型服务恢复，可以正常使用了。"
   }
 }

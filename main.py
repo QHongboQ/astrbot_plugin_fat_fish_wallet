@@ -1,6 +1,7 @@
 """大肥鱼钱包保卫战：高峰时段自动暂停模型服务，空闲时段自动恢复。"""
 
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -44,7 +45,7 @@ class FatFishWalletGuard(Star):
     指令：
     /峰谷              查询当前时段、供应商、下次切换、白名单、统计
     /峰谷 统计         今日拦截/豁免
-    /峰谷 强制 拦截|放行|自动   管理员手动控制
+    /峰谷 强制 开启|关闭|自动   管理员手动控制（开启=放行可用，关闭=暂停拦截）
     /白名单            管理可无视拦截的用户与群聊
     """
 
@@ -54,6 +55,9 @@ class FatFishWalletGuard(Star):
         self._wl_loaded = False
         self._wl_users: set[str] = set()
         self._wl_groups: set[str] = set()
+        self._groups_loaded = False
+        self._known_groups: set[str] = set()
+        self._reminder_task: asyncio.Task | None = None
 
     def _cfg(self, key, default=None):
         try:
@@ -184,21 +188,58 @@ class FatFishWalletGuard(Star):
         gid = event.get_group_id()
         return bool(gid and gid in self._wl_groups)
 
-    # 状态与统计
+    # 自动记录群聊（用于定时提醒目标）
 
-    async def _gate_state(self):
+    async def _load_known_groups(self):
+        if self._groups_loaded:
+            return
         try:
-            data = await self.get_kv_data("gate_state", {}) or {}
+            data = await self.get_kv_data("known_groups", []) or []
+            self._known_groups = {str(x) for x in data if str(x)}
+        except Exception:
+            self._known_groups = set()
+        self._groups_loaded = True
+
+    async def _save_known_groups(self):
+        try:
+            await self.put_kv_data("known_groups", sorted(self._known_groups))
+        except Exception:
+            pass
+
+    def _record_group(self, event: AstrMessageEvent):
+        if event.get_group_id() and event.unified_msg_origin:
+            umo = event.unified_msg_origin
+            if umo not in self._known_groups:
+                self._known_groups.add(umo)
+                asyncio.create_task(self._save_known_groups())
+
+    def _resolve_reminder_targets(self) -> list[str]:
+        targets = [str(x).strip() for x in (self._cfg("reminder_targets", []) or []) if str(x).strip()]
+        if not targets:
+            return sorted(self._known_groups)
+        out: list[str] = []
+        for t in targets:
+            if ":" in t:
+                out.append(t)
+            else:
+                out.extend(u for u in sorted(self._known_groups) if t in u)
+        return list(dict.fromkeys(out))
+
+    # 状态与统计（只记录自然时段切换，不受手动开关影响）
+
+    async def _period_state(self):
+        try:
+            data = await self.get_kv_data("period_state", {}) or {}
             if data.get("date") != self._now().strftime("%Y-%m-%d"):
                 return None
             return data.get("state")
         except Exception:
             return None
 
-    async def _save_gate_state(self, state):
+    async def _save_period_state(self, state):
         try:
             await self.put_kv_data(
-                "gate_state",
+                "period_state",
                 {"date": self._now().strftime("%Y-%m-%d"), "state": state},
             )
         except Exception:
@@ -269,14 +310,15 @@ class FatFishWalletGuard(Star):
             if not self._cfg("enabled", True) or self._is_my_command(event):
                 return
             await self._load_whitelist()
+            await self._load_known_groups()
+            self._record_group(event)
             now = self._now()
             peak = is_peak(now, self._periods(), self._weekdays())
             gated, reason = await self._gate_decision(event, now, peak)
-            prev = await self._gate_state()
+            override = str(self._cfg("manual_override", "auto") or "auto")
             wake = event.is_at_or_wake_command
 
             if gated:
-                # 拦截；非唤醒消息不提示，避免刷屏
                 event.should_call_llm(False)
                 event.stop_event()
                 await self._bump_stats("blocked")
@@ -284,37 +326,48 @@ class FatFishWalletGuard(Star):
                     return
                 provider = await self._provider_name(event.unified_msg_origin)
                 if reason == "manual":
-                    msg = self._cfg("manual_block_msg", "服务已被管理员手动暂停，等待恢复。")
-                elif prev in (None, "offpeak"):
                     msg = self._cfg(
-                        "peak_msg_enter",
-                        "已进入高峰时段，{provider} 高峰时段费用太贵，该时段将停止服务至空闲时段，到时自动恢复。",
+                        "manual_block_msg", "服务已被管理员手动关闭（拦截），等待恢复。"
                     )
                 else:
-                    msg = self._cfg(
-                        "peak_msg_steady",
-                        "当前处于高峰时段，{provider} 费用太贵，服务已暂停，空闲时段自动恢复。",
-                    )
+                    enter = await self._period_state() != "peak"
+                    if enter:
+                        msg = self._cfg(
+                            "peak_msg_enter",
+                            "已进入高峰时段，{provider} 高峰时段费用太贵，该时段将停止服务至空闲时段，到时自动恢复。",
+                        )
+                    else:
+                        msg = self._cfg(
+                            "peak_msg_steady",
+                            "当前处于高峰时段，{provider} 费用太贵，服务已暂停，空闲时段自动恢复。",
+                        )
+                    await self._save_period_state("peak")
                 await event.send(
                     self._notice(msg, self._cfg("peak_image", "高峰时段.png"), provider)
                 )
-                await self._save_gate_state("manual" if reason == "manual" else "peak")
                 return
 
             if peak and reason in ("admin", "whitelist", "provider"):
                 await self._bump_stats("bypassed")
 
-            if wake and not peak:
-                if self._cfg("announce_transition", True) and prev in ("peak", "manual"):
+            # 仅自动模式下处理自然时段切换提示
+            if wake and not peak and override == "auto":
+                if (
+                    self._cfg("announce_transition", True)
+                    and await self._period_state() == "peak"
+                ):
                     provider = await self._provider_name(event.unified_msg_origin)
                     await event.send(
                         self._notice(
-                            self._cfg("offpeak_msg", "已到达空闲时段，服务恢复，可以正常使用了。"),
+                            self._cfg(
+                                "offpeak_msg",
+                                "已到达空闲时段，服务恢复，可以正常使用了。",
+                            ),
                             self._cfg("offpeak_image", "空闲时段.png"),
                             provider,
                         )
                     )
-                await self._save_gate_state("offpeak")
+                await self._save_period_state("offpeak")
         except Exception as e:
             logger.error(f"[大肥鱼钱包保卫战] peak_gate 异常: {e}")
 
@@ -340,17 +393,17 @@ class FatFishWalletGuard(Star):
             if not event.is_admin():
                 yield event.plain_result("无权限，仅管理员可操作。")
                 return
-            if value in ("拦截", "开启", "block", "always_block"):
-                self.config["manual_override"] = "always_block"
-                reply = "已强制开启拦截，服务暂停（白名单/管理员仍可用）。"
-            elif value in ("放行", "关闭", "allow", "always_allow"):
+            if value in ("开启", "放行", "allow", "always_allow"):
                 self.config["manual_override"] = "always_allow"
-                reply = "已强制关闭拦截，服务放行。"
+                reply = "已强制开启服务（放行），不受时段限制，可正常使用。"
+            elif value in ("关闭", "拦截", "block", "always_block"):
+                self.config["manual_override"] = "always_block"
+                reply = "已强制关闭服务（拦截），暂停模型使用（白名单/管理员仍可用）。"
             elif value in ("自动", "auto"):
                 self.config["manual_override"] = "auto"
-                reply = "已恢复自动模式。"
+                reply = "已恢复自动模式，按时段自动拦截/放行。"
             else:
-                yield event.plain_result("用法：/峰谷 强制 拦截|放行|自动")
+                yield event.plain_result("用法：/峰谷 强制 开启|关闭|自动")
                 return
             try:
                 self.config.save_config()
@@ -360,7 +413,7 @@ class FatFishWalletGuard(Star):
             return
 
         if action:
-            yield event.plain_result("用法：/峰谷 [统计] [强制 拦截|放行|自动]")
+            yield event.plain_result("用法：/峰谷 [统计] [强制 开启|关闭|自动]")
             return
 
         now = self._now()
@@ -479,15 +532,94 @@ class FatFishWalletGuard(Star):
 
         yield event.plain_result("用法：/白名单 [添加|移除 用户|群 <ID>] [/白名单 清空]")
 
+    # 时段定时提醒
+
+    def _datetime_at(self, now: datetime, seconds: int) -> datetime:
+        h, rem = divmod(int(seconds), 3600)
+        m = rem // 60
+        s = rem % 60
+        return now.replace(hour=h, minute=m, second=s)
+
+    async def _send_reminder(self, kind):
+        if kind == "peak":
+            tmpl = self._cfg(
+                "reminder_peak_msg",
+                "提醒：高峰时段即将到来（约 {time}），过几分钟将暂停模型服务。",
+            )
+            image = str(self._cfg("peak_image", "高峰时段.png"))
+        else:
+            tmpl = self._cfg(
+                "reminder_offpeak_msg",
+                "提醒：已到达空闲时段，模型服务恢复，可以正常使用了。",
+            )
+            image = str(self._cfg("offpeak_image", "空闲时段.png"))
+        chain = self._notice(tmpl, image)
+        await self._load_known_groups()
+        for umo in self._resolve_reminder_targets():
+            try:
+                await self.context.send_message(umo, chain)
+            except Exception as e:
+                logger.error(f"[大肥鱼钱包保卫战] 发送提醒到 {umo} 失败: {e}")
+
+    async def _check_reminders(self):
+        if not self._cfg("reminder_enabled", True):
+            return
+        if str(self._cfg("manual_override", "auto") or "auto") != "auto":
+            return
+        now = self._now()
+        today = now.strftime("%Y-%m-%d")
+        periods = self._periods()
+        weekdays = self._weekdays()
+        if not periods:
+            return
+        if weekdays and now.weekday() not in weekdays:
+            return
+        lead = max(0, int(self._cfg("reminder_lead_minutes", 5)))
+        fired = await self.get_kv_data("reminder_fired", {}) or {}
+        if fired.get("date") != today:
+            fired = {"date": today, "events": []}
+        done = set(fired.get("events", []))
+        events = []
+        for i, p in enumerate(periods):
+            start_at = self._datetime_at(now, p.start) - timedelta(minutes=lead)
+            end_at = self._datetime_at(now, p.end)
+            events.append((f"peakstart_{i}", start_at, "peak"))
+            events.append((f"peakend_{i}", end_at, "offpeak"))
+        changed = False
+        for key, moment, kind in events:
+            if key in done:
+                continue
+            if moment <= now < moment + timedelta(minutes=3):
+                await self._send_reminder(kind)
+                done.add(key)
+                changed = True
+        if changed:
+            await self.put_kv_data("reminder_fired", {"date": today, "events": sorted(done)})
+
+    async def _reminder_loop(self):
+        while True:
+            try:
+                await self._check_reminders()
+            except Exception as e:
+                logger.error(f"[大肥鱼钱包保卫战] 提醒循环异常: {e}")
+            await asyncio.sleep(30)
+
     # 生命周期
 
     async def initialize(self):
         await self._load_whitelist()
+        await self._load_known_groups()
         peak = is_peak(self._now(), self._periods(), self._weekdays())
         logger.info(
             f"[大肥鱼钱包保卫战] 已加载，当前{'高峰' if peak else '空闲'}时段，"
             f"白名单用户 {len(self._wl_users)} / 群 {len(self._wl_groups)}"
         )
+        if self._cfg("reminder_enabled", True):
+            self._reminder_task = asyncio.create_task(self._reminder_loop())
 
     async def terminate(self):
+        if self._reminder_task:
+            self._reminder_task.cancel()
+            self._reminder_task = None
         await self._save_whitelist()
+        await self._save_known_groups()
