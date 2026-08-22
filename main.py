@@ -214,7 +214,11 @@ class FatFishWalletGuard(Star):
                 asyncio.create_task(self._save_known_groups())
 
     def _resolve_reminder_targets(self) -> list[str]:
-        targets = [str(x).strip() for x in (self._cfg("reminder_targets", []) or []) if str(x).strip()]
+        targets = [
+            str(x).strip()
+            for x in (self._cfg("reminder_targets", []) or [])
+            if str(x).strip()
+        ]
         if not targets:
             return sorted(self._known_groups)
         out: list[str] = []
@@ -304,25 +308,31 @@ class FatFishWalletGuard(Star):
             return False, "provider"
         return True, "peak"
 
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=100)
+    @filter.event_message_type(
+        filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE,
+        priority=100,
+    )
     async def peak_gate(self, event: AstrMessageEvent):
         try:
             if not self._cfg("enabled", True) or self._is_my_command(event):
                 return
-            await self._load_whitelist()
             await self._load_known_groups()
             self._record_group(event)
+            # 非唤醒消息（群聊闲聊、状态类事件等）不拦截不提示，避免刷屏
+            if not event.is_at_or_wake_command:
+                return
+            await self._load_whitelist()
             now = self._now()
             peak = is_peak(now, self._periods(), self._weekdays())
             gated, reason = await self._gate_decision(event, now, peak)
             override = str(self._cfg("manual_override", "auto") or "auto")
-            wake = event.is_at_or_wake_command
+            can_notice = await self._can_notice(event)
 
             if gated:
                 event.should_call_llm(False)
                 event.stop_event()
                 await self._bump_stats("blocked")
-                if not wake:
+                if not can_notice:
                     return
                 provider = await self._provider_name(event.unified_msg_origin)
                 if reason == "manual":
@@ -345,16 +355,18 @@ class FatFishWalletGuard(Star):
                 await event.send(
                     self._notice(msg, self._cfg("peak_image", "高峰时段.png"), provider)
                 )
+                await self._mark_notified(event)
                 return
 
             if peak and reason in ("admin", "whitelist", "provider"):
                 await self._bump_stats("bypassed")
 
             # 仅自动模式下处理自然时段切换提示
-            if wake and not peak and override == "auto":
+            if not peak and override == "auto":
                 if (
                     self._cfg("announce_transition", True)
                     and await self._period_state() == "peak"
+                    and can_notice
                 ):
                     provider = await self._provider_name(event.unified_msg_origin)
                     await event.send(
@@ -367,9 +379,49 @@ class FatFishWalletGuard(Star):
                             provider,
                         )
                     )
+                    await self._mark_notified(event)
                 await self._save_period_state("offpeak")
         except Exception as e:
             logger.error(f"[大肥鱼钱包保卫战] peak_gate 异常: {e}")
+
+    async def _can_notice(self, event) -> bool:
+        if not event.is_private_chat():
+            return True
+        mode = str(self._cfg("private_notify_mode", "once") or "once")
+        if mode == "never":
+            return False
+        if mode == "always":
+            return True
+        notified = await self._private_notified_today(event.unified_msg_origin)
+        return event.unified_msg_origin not in notified
+
+    async def _mark_notified(self, event):
+        if not event.is_private_chat():
+            return
+        if str(self._cfg("private_notify_mode", "once") or "once") != "once":
+            return
+        await self._mark_private_notified(event.unified_msg_origin)
+
+    async def _private_notified_today(self, umo) -> set:
+        try:
+            data = await self.get_kv_data("private_notified", {}) or {}
+            if data.get("date") != self._now().strftime("%Y-%m-%d"):
+                return set()
+            return set(data.get("sessions") or [])
+        except Exception:
+            return set()
+
+    async def _mark_private_notified(self, umo):
+        try:
+            today = self._now().strftime("%Y-%m-%d")
+            data = await self.get_kv_data("private_notified", {}) or {}
+            sessions = set(data.get("sessions") or []) if data.get("date") == today else set()
+            sessions.add(umo)
+            await self.put_kv_data(
+                "private_notified", {"date": today, "sessions": sorted(sessions)}
+            )
+        except Exception:
+            pass
 
     # 指令：/峰谷
 

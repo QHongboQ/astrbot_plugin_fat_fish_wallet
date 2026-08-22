@@ -80,6 +80,12 @@
     "type": "bool",
     "default": true
   },
+  "private_notify_mode": {
+    "description": "私信高峰提示频率：once=每天一次/always=每次/never=不提示",
+    "type": "string",
+    "options": ["once", "always", "never"],
+    "default": "once"
+  },
   "whitelist_users": {
     "description": "初始白名单用户（用 /白名单 管理）",
     "type": "list",

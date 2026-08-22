@@ -75,6 +75,7 @@
 | `manual_block_msg` | 手动拦截提示文案 | 同上 |
 | `manual_override` | `auto` | `auto` / `always_allow`（放行）/ `always_block`（拦截） |
 | `announce_transition` | `true` | 时段切换时是否发送提示 |
+| `private_notify_mode` | `once` | 私信高峰提示频率：`once`（每天一次）/ `always`（每次）/ `never`（不提示） |
 | `whitelist_users` / `whitelist_groups` | `[]` | 初始白名单种子，之后用 `/白名单` 指令管理 |
 | `reminder_enabled` | `true` | 时段自动提醒总开关 |
 | `reminder_targets` | `[]` | 提醒目标；留空=自动记录的所有群；也可填群号或完整消息来源 |
