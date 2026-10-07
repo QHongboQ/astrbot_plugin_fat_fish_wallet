@@ -169,6 +169,27 @@ class FatFishPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("→ 空闲", transition_line)
         self.assertIn("钱包策略：offpeak（允许）", status_text)
 
+    async def test_manual_override_status_has_no_normal_transition(self):
+        self.config["manual_override"] = "always_block"
+        now = datetime(2026, 10, 7, 14, 55, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.guard._now = lambda: now
+        self.guard._load_whitelist = AsyncMock()
+        self.guard._today_stats = AsyncMock(
+            return_value={"date": "2026-10-07", "blocked": 0, "bypassed": 0}
+        )
+        self.guard._get_current_provider = AsyncMock(
+            return_value=("deepseek/model", Provider("deepseek/model"))
+        )
+        result = [item async for item in self.guard.peak_status(StatusEvent())]
+        status_text = "\n".join(
+            str(getattr(item, "text", item)) for item in result[0]
+        )
+        transition_line = next(
+            line for line in status_text.splitlines() if line.startswith("下次切换：")
+        )
+        self.assertIn("当前策略下无预定切换", transition_line)
+        self.assertIn("钱包策略：forced block（拦截）", status_text)
+
     async def test_startup_log_uses_public_policy_on_holiday(self):
         now = datetime(2026, 10, 7, 14, 55, tzinfo=ZoneInfo("Asia/Shanghai"))
         self.guard._now = lambda: now
