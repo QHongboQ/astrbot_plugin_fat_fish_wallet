@@ -7,7 +7,7 @@ import types
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -32,7 +32,17 @@ class Context:
         return Provider(provider_id) if provider_id else None
 
 
-class FatFishPolicyTests(unittest.TestCase):
+class StatusEvent:
+    unified_msg_origin = "aiocqhttp:GroupMessage:123"
+
+    def is_admin(self):
+        return False
+
+    def chain_result(self, chain):
+        return chain
+
+
+class FatFishPolicyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.config = {
             "enabled": True,
@@ -117,6 +127,59 @@ class FatFishPolicyTests(unittest.TestCase):
             provider_id="deepseek/model",
         )
         self.assertEqual(self.guard._gate_decision(event, policy), (True, "manual"))
+
+    async def test_holiday_suppresses_peak_and_fake_offpeak_reminders(self):
+        self.guard.get_kv_data = AsyncMock(return_value={})
+        self.guard.put_kv_data = AsyncMock()
+        self.guard._send_reminder = AsyncMock()
+        now = datetime(2026, 10, 7, 13, 55, tzinfo=ZoneInfo("Asia/Shanghai"))
+        await self.guard._check_reminders(now)
+        self.guard._send_reminder.assert_not_awaited()
+        self.guard.put_kv_data.assert_not_awaited()
+
+    async def test_regular_peak_start_reminder_remains_enabled(self):
+        self.guard.get_kv_data = AsyncMock(return_value={})
+        self.guard.put_kv_data = AsyncMock()
+        self.guard._send_reminder = AsyncMock()
+        now = datetime(2026, 10, 8, 13, 55, tzinfo=ZoneInfo("Asia/Shanghai"))
+        await self.guard._check_reminders(now)
+        self.guard._send_reminder.assert_awaited_once_with("peak")
+
+    async def test_peak_status_reports_policy_consistent_transition(self):
+        now = datetime(2026, 10, 7, 14, 55, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.guard._now = lambda: now
+        self.guard._load_whitelist = AsyncMock()
+        self.guard._today_stats = AsyncMock(
+            return_value={"date": "2026-10-07", "blocked": 0, "bypassed": 0}
+        )
+        self.guard._get_current_provider = AsyncMock(
+            return_value=("deepseek/model", Provider("deepseek/model"))
+        )
+        result = [
+            item
+            async for item in self.guard.peak_status(StatusEvent())
+        ]
+        status_text = "\n".join(
+            str(getattr(item, "text", item)) for item in result[0]
+        )
+        transition_line = next(
+            line for line in status_text.splitlines() if line.startswith("下次切换：")
+        )
+        self.assertIn("高峰", transition_line)
+        self.assertNotIn("→ 空闲", transition_line)
+        self.assertIn("钱包策略：offpeak（允许）", status_text)
+
+    async def test_startup_log_uses_public_policy_on_holiday(self):
+        now = datetime(2026, 10, 7, 14, 55, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.guard._now = lambda: now
+        self.guard._load_whitelist = AsyncMock()
+        self.guard._load_known_groups = AsyncMock()
+        self.config["reminder_enabled"] = False
+        with patch("fatfish_policy_test_package.main.logger.info") as logger_info:
+            await self.guard.initialize()
+        rendered = " ".join(str(arg) for arg in logger_info.call_args.args)
+        self.assertIn("offpeak", rendered)
+        self.assertNotIn("当前高峰", rendered)
 
 
 if __name__ == "__main__":

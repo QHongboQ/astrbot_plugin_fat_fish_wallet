@@ -34,7 +34,7 @@
 
 ## 公共策略接口
 
-其他插件可调用活动实例的 `FatFishWalletGuard.get_wallet_policy(*, at=None, provider_id=None)` 获取只读决策。返回内容包括 `enabled`、`allowed`、`state`、`timezone`、`manual_override`、`provider_affected`、`holiday`、`holiday_name`、`peak_periods` 和 `peak_weekdays`。普通消息闸门与 `/峰谷` 状态使用同一策略函数；自动模式按 `holidays.CN()` 将中国法定节假日视为非高峰。强制放行/拦截及总开关优先于自动时段策略；此接口不处理管理员或白名单豁免。
+其他插件可调用活动实例的 `FatFishWalletGuard.get_wallet_policy(*, at=None, provider_id=None)` 获取只读决策。返回内容包括 `enabled`、`allowed`、`state`、`timezone`、`manual_override`、`provider_affected`、`holiday`、`holiday_name`、`peak_periods` 和 `peak_weekdays`。普通消息闸门、`/峰谷` 状态、启动状态和高峰提醒均使用同一策略函数；自动模式按 `holidays.CN()` 将中国法定节假日视为非高峰，节假日不会生成虚假的进/出高峰提醒。强制放行/拦截及总开关优先于自动时段策略；此接口不处理管理员或白名单豁免。
 
 ## 安装
 
