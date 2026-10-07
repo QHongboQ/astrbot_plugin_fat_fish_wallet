@@ -188,6 +188,7 @@ class FatFishPolicyTests(unittest.IsolatedAsyncioTestCase):
             line for line in status_text.splitlines() if line.startswith("下次切换：")
         )
         self.assertIn("当前策略下无预定切换", transition_line)
+        self.assertIn("当前时段：手动策略覆盖", status_text)
         self.assertIn("钱包策略：forced block（拦截）", status_text)
 
     async def test_startup_log_uses_public_policy_on_holiday(self):

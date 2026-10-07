@@ -559,6 +559,10 @@ class FatFishWalletGuard(Star):
         periods_txt = fmt_periods_for_display(
             str(self._cfg("peak_periods", DEFAULT_PEAK_PERIODS))
         )
+        period_label = {
+            "peak": "高峰",
+            "offpeak": "空闲",
+        }.get(policy["state"], "手动策略覆盖")
         if target is None or when is None:
             transition_txt = "当前策略下无预定切换"
         else:
@@ -567,7 +571,7 @@ class FatFishWalletGuard(Star):
             transition_txt = f"约 {remain_txt} → {next_txt}"
         lines = [
             "【大肥鱼钱包保卫战】",
-            f"当前时段：{'高峰' if peak else '空闲'}",
+            f"当前时段：{period_label}",
             f"时段配置：{periods_txt}",
             f"中国法定节假日：{policy['holiday_name'] or ('是' if policy['holiday'] else '否')}",
             f"钱包策略：{policy['state']}（{'允许' if policy['allowed'] else '拦截'}）",
